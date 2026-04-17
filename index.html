@@ -1882,7 +1882,17 @@ function saveTrade(d){
     d.emotion||'', d.discipline||'',
     d.note||'', d.imgLink||'', _now()
   ];
+  // หา row ด้วย ID ก่อน ถ้าไม่เจอให้ลอง fingerprint (date+port+asset+side+entry) ป้องกัน duplicate
   var existing=_findRow(sh,1,id);
+  if(existing&lt;0){
+    var fp=String(d.date||'')+'|'+(d.portfolio||'default')+'|'+String(d.asset||'')+'|'+String(d.side||'')+'|'+String(parseFloat(d.entry)||0)+'|'+String(parseFloat(d.lots)||0);
+    existing=_findRowByFingerprint(sh,fp);
+    if(existing&gt;0){
+      // เจอ row ที่ตรง fingerprint → อัปเดต ID ให้ตรง แล้ว overwrite
+      id=String(sh.getRange(existing,1).getValue()||id);
+      row[0]=id;
+    }
+  }
   if(existing&gt;0) sh.getRange(existing,1,1,row.length).setValues([row]);
   else{ sh.appendRow(row); existing=sh.getLastRow(); }
   _styleTradeRow(sh,existing,d.result,pnl);
@@ -2138,6 +2148,17 @@ function _findRow2(sh,col1,val1,col2,val2){
   }
   return -1;
 }
+// หา row จาก fingerprint = date|portfolio|asset|side|entry|lots (col: 2|3|4|5|7|6)
+function _findRowByFingerprint(sh,fp){
+  if(sh.getLastRow()&lt;2) return -1;
+  var data=sh.getDataRange().getValues();
+  for(var i=1;i&lt;data.length;i++){
+    var r=data[i];
+    var rowFp=String(r[1])+'|'+String(r[2])+'|'+String(r[3])+'|'+String(r[4])+'|'+String(parseFloat(r[6])||0)+'|'+String(parseFloat(r[5])||0);
+    if(rowFp===fp) return i+1;
+  }
+  return -1;
+}
 function _log(action,detail,portfolio,source,result){
   try{
     var sh=_sheet(SHEET.LOG,HDR.LOG);
@@ -2156,15 +2177,26 @@ function cleanDuplicates(){
   var ss=SpreadsheetApp.getActiveSpreadsheet();
   var report=[];
 
-  // Clean Trades (dedup by ID col 1)
+  // Clean Trades (dedup by ID ก่อน ถ้าไม่มี ID ใช้ fingerprint: date|portfolio|asset|side|entry|lots)
   var tSh=ss.getSheetByName(SHEET.TRADES);
   if(tSh&amp;&amp;tSh.getLastRow()&gt;1){
     var tData=tSh.getDataRange().getValues();
-    var tSeen={}; var tDel=[];
+    var tSeenId={}; var tSeenFp={}; var tDel=[];
     for(var i=tData.length-1;i&gt;=1;i--){
-      var tid=String(tData[i][0]).trim();
-      if(!tid){ tDel.push(i+1); continue; }
-      if(tSeen[tid]){ tDel.push(i+1); } else { tSeen[tid]=true; }
+      var r=tData[i];
+      var tid=String(r[0]).trim();
+      var tfp=String(r[1])+'|'+String(r[2])+'|'+String(r[3])+'|'+String(r[4])+'|'+String(parseFloat(r[6])||0)+'|'+String(parseFloat(r[5])||0);
+      if(!tid&amp;&amp;!tfp){ tDel.push(i+1); continue; }
+      // ถ้ามี ID → dedup by ID
+      if(tid){
+        if(tSeenId[tid]){ tDel.push(i+1); continue; }
+        tSeenId[tid]=true;
+      }
+      // dedup by fingerprint ด้วย (จับ trade ที่มี ID ต่างกันแต่ข้อมูลเหมือนกัน)
+      if(tfp){
+        if(tSeenFp[tfp]){ tDel.push(i+1); continue; }
+        tSeenFp[tfp]=true;
+      }
     }
     tDel.sort(function(a,b){return b-a;}).forEach(function(r){tSh.deleteRow(r);});
     report.push('Trades: removed '+tDel.length+' duplicates');
@@ -2592,16 +2624,21 @@ function syncFromSheet(onDone){
 
       // ── 1. Portfolios ──
       if(d.portfolios && Object.keys(d.portfolios).length){
-        // ล้าง trade/session data เก่าของทุก portfolio ก่อน (Sheet = source of truth)
+        // FIX: snapshot local trades ก่อนลบ — เพื่อ merge กลับ pending trades ที่ยังไม่ sync ขึ้น Sheet
+        // (เช่น Topstep import ที่ใช้ no-cors บันทึกลง localStorage แล้วแต่ Sheet ยังไม่รับ)
         var allKnownPorts = Object.keys(S.portfolios).concat(Object.keys(d.portfolios));
         var seenPorts = {};
+        var _localTradesSnapshot = {}; // เก็บ local trades ก่อนลบ
         allKnownPorts.forEach(function(pid){
           if(!seenPorts[pid]){
             seenPorts[pid]=1;
+            // เก็บ snapshot ก่อน remove
+            try{ _localTradesSnapshot[pid] = JSON.parse(localStorage.getItem('port_'+pid+'_t')||'{}'); }catch(e){ _localTradesSnapshot[pid]={}; }
             localStorage.removeItem('port_'+pid+'_t');
             localStorage.removeItem('port_'+pid+'_s');
           }
         });
+        // ล้าง dt_trades เก่าด้วยเพราะ DataTrades จะ replace ใหม่จาก Sheet
         localStorage.removeItem('dt_trades');
 
         var merged = {};
@@ -2725,24 +2762,54 @@ function syncFromSheet(onDone){
             imgLink:     gs(t,['ImageLink','imagelink','imgLink'])
           });
         });
-        // Sheet = source of truth ทั้งหมด ไม่ merge กับ local (ป้องกัน duplicate)
+        // Save each portfolio's trades to localStorage
+        // FIX: ใช้ข้อมูลจาก Sheet เป็น source of truth ต่อ portfolio
+        // เก็บเฉพาะวันที่มาจาก Sheet แทนที่ (replace) ไม่ใช่ merge กับของเก่า
+        // เพื่อป้องกัน duplicate orders จากการ merge ซ้ำหลายรอบ
         var portsFromSheet = Object.keys(byPort);
         portsFromSheet.forEach(function(port){
+          // กรองวันที่ถูกลบ (tombstone) ออกก่อน save
           var tombstone = {};
           try{ tombstone = JSON.parse(localStorage.getItem('tj_deleted_'+port)||'{}'); }catch(e){}
           var filtered = {};
           Object.keys(byPort[port]).forEach(function(date){
-            if(!tombstone[date]){
-              filtered[date] = _dedupTrades(byPort[port][date]||[]);
-            }
+            if(!tombstone[date]) filtered[date] = byPort[port][date];
           });
-          localStorage.setItem('port_'+port+'_t', JSON.stringify(filtered));
+          // ── FIX: Merge Sheet data กับ local — ไม่ลบ trades ที่ local มีแต่ Sheet ยังไม่ได้รับ ──
+          // เหตุผล: Topstep import / manual add อาจยังไม่ sync ขึ้น Sheet ทัน
+          // Strategy: Sheet เป็น source of truth ต่อ trade ID — ถ้า Sheet มี ID นั้น ใช้ของ Sheet
+          //           ถ้า local มี trade ที่ Sheet ไม่มี → เก็บไว้ (pending sync)
+          // ใช้ snapshot ที่เก็บไว้ก่อนทำ removeItem เพื่อให้ pending trades ไม่หาย
+          var localRaw = _localTradesSnapshot[port] || {};
+          try{ var _lsCheck = localStorage.getItem('port_'+port+'_t'); if(_lsCheck) localRaw = JSON.parse(_lsCheck); }catch(e){}
+          // สร้าง set ของ IDs ที่มีใน Sheet (filtered)
+          var sheetIds = {};
+          Object.keys(filtered).forEach(function(date){
+            (filtered[date]||[]).forEach(function(t){ if(t.id) sheetIds[String(t.id)]=true; });
+          });
+          // Merge: เริ่มจาก filtered (Sheet) แล้วเพิ่ม local trades ที่ไม่มีใน Sheet
+          var merged = {};
+          Object.keys(filtered).forEach(function(date){ merged[date] = filtered[date].slice(); });
+          Object.keys(localRaw).forEach(function(date){
+            (localRaw[date]||[]).forEach(function(t){
+              var tid = String(t.id||'');
+              if(tid && sheetIds[tid]) return; // Sheet มีแล้ว ข้าม
+              if(!tid) return; // ไม่มี id ข้าม
+              if(!merged[date]) merged[date] = [];
+              merged[date].push(t); // local-only trade → เก็บไว้
+            });
+          });
+          // dedup ทุกวัน
+          Object.keys(merged).forEach(function(date){ merged[date]=_dedupTrades(merged[date]||[]); });
+          localStorage.setItem('port_'+port+'_t', JSON.stringify(merged));
+          // อัปเดต S.trades ใน memory
           if(port === S.currentPortfolio){
             var popupOpen = document.getElementById('mDay') && document.getElementById('mDay').classList.contains('open');
-            Object.keys(filtered).forEach(function(date){
+            Object.keys(merged).forEach(function(date){
               if(popupOpen && S.mKey && date === S.mKey) return;
-              S.trades[date] = filtered[date];
+              S.trades[date] = merged[date];
             });
+            // เพิ่มวันใหม่ที่ local มีแต่ merged ไม่มี (ไม่ลบอะไร)
           }
         });
       }
@@ -4131,21 +4198,18 @@ function mEmoClick(e){
 }
 
 function _dedupTrades(arr){
-  // ใช้ id เป็น key หลัก ถ้าไม่มีใช้ date+asset+side+entry+entryTime+lots เป็น fingerprint
-  var seen = {};
-  var result = [];
-  for(var i = arr.length - 1; i >= 0; i--){
-    var t = arr[i];
-    var key = String(t.id || t._id || '');
+  // ลบ duplicate trades โดยเก็บ trade ล่าสุดของแต่ละ id
+  var seen={};
+  return arr.filter(function(t){
+    var key=String(t.id||'');
     if(!key){
-      var eTime = String(t.entryDate||t.entryDateRaw||t.entryTime||'');
-      key = (t.date||'')+'|'+(t.asset||'')+'|'+(t.side||'')+'|'+(t.entry||'')+'|'+eTime.substring(0,5)+'|'+(t.lots||'');
+      // ไม่มี id → ใช้ entry+side+lots เป็น key
+      key=(t.entry||'')+'_'+(t.side||'')+'_'+(t.lots||'')+'_'+(t.asset||'');
     }
-    if(!key || seen[key]) continue;
-    seen[key] = true;
-    result.unshift(t);
-  }
-  return result;
+    if(seen[key]) return false;
+    seen[key]=true;
+    return true;
+  });
 }
 function openDay(dt){
   S.mKey=dk(dt);S.mTrades=_dedupTrades(JSON.parse(JSON.stringify(S.trades[S.mKey]||[])));
