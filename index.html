@@ -1463,9 +1463,14 @@ input[type="datetime-local"]::-webkit-calendar-picker-indicator{filter:invert(0.
     </div>
     <div class="field-label">Apps Script URL</div>
     <input class="settings-input" id="sheetUrl" placeholder="https://script.google.com/macros/s/.../exec" oninput="openSheet_onUrlChange()">
-    <div style="margin-top:10px;"><div class="field-label" style="margin-bottom:5px;">📋 Code:</div>
+    <div style="margin-top:10px;"><div class="field-label" style="margin-bottom:5px;">📋 Code: <span style="font-size:10px;background:var(--green-dim);color:var(--green);border:1px solid var(--green);border-radius:4px;padding:1px 7px;margin-left:6px;font-family:var(--font-mono);font-weight:700;">v5.1</span></div>
     <div class="code-block">/* =========================================
-   TradeLog Pro+ — Google Apps Script v5.0
+   TradeLog Pro+ — Google Apps Script v5.1
+   Changelog:
+     v5.1 - Fix duplicate trades: sync lock, Sheet=source of truth, fingerprint dedup
+          - Fix cleanDuplicates: remove getUi().alert, add fingerprint for Trades
+          - Fix saveTrade: fingerprint upsert before appendRow
+     v5.0 - Initial release
    รองรับ: Portfolio | Data Mode Trades
            Candle | Mode | TF | Trend
            Zone | Confirm | Sessions
@@ -1519,7 +1524,7 @@ function doGet(e){
   if(p&amp;&amp;p.action==='loadAll')           return _json(loadAll());
   if(p&amp;&amp;p.action==='cleanDuplicates')   return _json(cleanDuplicates());
   if(p&amp;&amp;p.action==='clearAllDataTrades')  return _json(clearAllDataTrades(p));
-  return _json({status:'ready',version:'5.0',time:new Date().toISOString()});
+  return _json({status:'ready',version:'5.1',time:new Date().toISOString()});
 }
 function loadAll(){
   try{
@@ -1882,16 +1887,11 @@ function saveTrade(d){
     d.emotion||'', d.discipline||'',
     d.note||'', d.imgLink||'', _now()
   ];
-  // หา row ด้วย ID ก่อน ถ้าไม่เจอให้ลอง fingerprint (date+port+asset+side+entry) ป้องกัน duplicate
   var existing=_findRow(sh,1,id);
   if(existing&lt;0){
     var fp=String(d.date||'')+'|'+(d.portfolio||'default')+'|'+String(d.asset||'')+'|'+String(d.side||'')+'|'+String(parseFloat(d.entry)||0)+'|'+String(parseFloat(d.lots)||0);
     existing=_findRowByFingerprint(sh,fp);
-    if(existing&gt;0){
-      // เจอ row ที่ตรง fingerprint → อัปเดต ID ให้ตรง แล้ว overwrite
-      id=String(sh.getRange(existing,1).getValue()||id);
-      row[0]=id;
-    }
+    if(existing&gt;0){ id=String(sh.getRange(existing,1).getValue()||id); row[0]=id; }
   }
   if(existing&gt;0) sh.getRange(existing,1,1,row.length).setValues([row]);
   else{ sh.appendRow(row); existing=sh.getLastRow(); }
@@ -2148,7 +2148,6 @@ function _findRow2(sh,col1,val1,col2,val2){
   }
   return -1;
 }
-// หา row จาก fingerprint = date|portfolio|asset|side|entry|lots (col: 2|3|4|5|7|6)
 function _findRowByFingerprint(sh,fp){
   if(sh.getLastRow()&lt;2) return -1;
   var data=sh.getDataRange().getValues();
@@ -2177,26 +2176,19 @@ function cleanDuplicates(){
   var ss=SpreadsheetApp.getActiveSpreadsheet();
   var report=[];
 
-  // Clean Trades (dedup by ID ก่อน ถ้าไม่มี ID ใช้ fingerprint: date|portfolio|asset|side|entry|lots)
+  // Clean Trades (dedup by ID + fingerprint: date|portfolio|asset|side|entry|lots)
   var tSh=ss.getSheetByName(SHEET.TRADES);
-  if(tSh&amp;&amp;tSh.getLastRow()&gt;1){
+  if(tSh&&tSh.getLastRow()>1){
     var tData=tSh.getDataRange().getValues();
     var tSeenId={}; var tSeenFp={}; var tDel=[];
-    for(var i=tData.length-1;i&gt;=1;i--){
+    for(var i=tData.length-1;i>=1;i--){
       var r=tData[i];
       var tid=String(r[0]).trim();
       var tfp=String(r[1])+'|'+String(r[2])+'|'+String(r[3])+'|'+String(r[4])+'|'+String(parseFloat(r[6])||0)+'|'+String(parseFloat(r[5])||0);
-      if(!tid&amp;&amp;!tfp){ tDel.push(i+1); continue; }
-      // ถ้ามี ID → dedup by ID
-      if(tid){
-        if(tSeenId[tid]){ tDel.push(i+1); continue; }
-        tSeenId[tid]=true;
-      }
-      // dedup by fingerprint ด้วย (จับ trade ที่มี ID ต่างกันแต่ข้อมูลเหมือนกัน)
-      if(tfp){
-        if(tSeenFp[tfp]){ tDel.push(i+1); continue; }
-        tSeenFp[tfp]=true;
-      }
+      var skip=false;
+      if(tid){ if(tSeenId[tid]){skip=true;}else{tSeenId[tid]=true;} }
+      if(!skip&&tfp){ if(tSeenFp[tfp]){skip=true;}else{tSeenFp[tfp]=true;} }
+      if(skip) tDel.push(i+1);
     }
     tDel.sort(function(a,b){return b-a;}).forEach(function(r){tSh.deleteRow(r);});
     report.push('Trades: removed '+tDel.length+' duplicates');
@@ -2235,7 +2227,6 @@ function cleanDuplicates(){
 
   var msg=report.join('\n');
   _log('cleanDuplicates',msg,'','system','ok');
-  SpreadsheetApp.getUi().alert('✅ Clean เสร็จ!\n\n'+msg);
   return {status:'ok',report:report};
 }
 
@@ -2251,7 +2242,7 @@ function setupSheets(){
   var ss=SpreadsheetApp.getActiveSpreadsheet();
   var def=ss.getSheetByName('Sheet1');
   if(def&amp;&amp;ss.getSheets().length&gt;1) ss.deleteSheet(def);
-  SpreadsheetApp.getUi().alert('✅ TradeLog Pro+ v5.0 พร้อม!\n\nSheets: Trades | DataTrades | Sessions | Summary | Assets | Journal | Log | DeletedPorts\nรองรับ: Multi-Portfolio + Data Mode + Custom Assets + Fees + Commission\nLog: ครบทุก action + Source (port/data/system) + 2000 rows\nDeletedPorts: tombstone ถาวร ป้องกันพอร์ตเด้งกลับ\n\n⚡ หมายเหตุ: ถ้า Sheet เดิมมี Header ไม่ครบ ระบบจะเพิ่ม Column ใหม่ให้อัตโนมัติ');
+  SpreadsheetApp.getUi().alert('✅ TradeLog Pro+ v5.1 พร้อม!\n\nSheets: Trades | DataTrades | Sessions | Summary | Assets | Journal | Log | DeletedPorts\nรองรับ: Multi-Portfolio + Data Mode + Custom Assets + Fees + Commission\nLog: ครบทุก action + Source (port/data/system) + 2000 rows\nDeletedPorts: tombstone ถาวร ป้องกันพอร์ตเด้งกลับ\n\n⚡ หมายเหตุ: ถ้า Sheet เดิมมี Header ไม่ครบ ระบบจะเพิ่ม Column ใหม่ให้อัตโนมัติ');
 }
 function onOpen(){
   SpreadsheetApp.getUi().createMenu('🔧 TradeLog Pro+')
@@ -2536,20 +2527,20 @@ var S={sessions:{},trades:{},scriptUrl:'',keys:{mGem:'gemini-2.5-flash-preview-0
 function cleanSheetDuplicates(){
   if(!S.scriptUrl){ showToast('ยังไม่ได้ตั้งค่า Sheet URL','error'); return; }
   if(!confirm('🔧 จะสั่งให้ Google Sheet ลบ Duplicate Rows ออกถาวร\n(Trades, Sessions, DataTrades)\n\nดำเนินการต่อ?')) return;
-  showToast('🔧 กำลัง Clean Sheet Duplicates...','success');
-  fetch(S.scriptUrl+'?action=cleanDuplicates')
-    .then(function(r){return r.json();})
-    .then(function(d){
-      if(d.status==='ok'){
-        var rpt=(d.report||[]).join(', ');
-        showToast('✅ Clean เสร็จ! '+rpt,'success');
-        // หลัง clean แล้ว re-sync ดึงข้อมูลที่สะอาดกลับมา
-        setTimeout(function(){ clearAndResync(); }, 1000);
-      } else {
-        showToast('⚠ Clean error: '+(d.msg||'unknown'),'error');
-      }
+  showToast('🔧 กำลัง Clean Sheet Duplicates... (อาจใช้เวลา 10-30 วิ)','success');
+  var ctrl=typeof AbortController!=='undefined'?new AbortController():null;
+  var timer=ctrl?setTimeout(function(){ctrl.abort();},50000):null;
+  fetch(S.scriptUrl+'?action=cleanDuplicates',ctrl?{signal:ctrl.signal}:{})
+    .then(function(r){ if(timer)clearTimeout(timer); if(!r.ok)throw new Error('HTTP '+r.status); return r.text(); })
+    .then(function(txt){
+      var d; try{d=JSON.parse(txt);}catch(e){throw new Error('GAS ตอบผิด format');}
+      if(d.status==='ok'){ showToast('✅ Clean เสร็จ! '+(d.report||[]).join(', '),'success'); setTimeout(function(){syncFromSheet();},1000); }
+      else showToast('⚠ '+(d.msg||'error'),'error');
     })
-    .catch(function(err){ showToast('❌ Clean failed: '+err.message,'error'); });
+    .catch(function(err){
+      if(timer)clearTimeout(timer);
+      showToast('❌ Clean failed: '+(err.message||'unknown')+' — ลองรัน cleanDuplicates() ใน Apps Script Editor โดยตรง','error');
+    });
 }
 
 // ── ลบ Duplicate Trades ออกจาก localStorage ทุก Portfolio ──
@@ -2606,8 +2597,11 @@ function clearAndResync(){
 }
 
 // ── ดึงข้อมูลทั้งหมดจาก Sheet มาอัพเดต Browser ──
+var _syncInProgress = false;
 function syncFromSheet(onDone){
   if(!S.scriptUrl) return;
+  if(_syncInProgress){ if(onDone) setTimeout(function(){ if(onDone) onDone(); },3000); return; }
+  _syncInProgress = true;
   showToast('🔄 กำลังดึงข้อมูลจาก Sheet...','success');
   var sheetRes=document.getElementById('sheetRes');
   if(sheetRes){sheetRes.style.color='var(--text-muted)';sheetRes.textContent='🔄 กำลัง Sync...';}
@@ -2624,21 +2618,16 @@ function syncFromSheet(onDone){
 
       // ── 1. Portfolios ──
       if(d.portfolios && Object.keys(d.portfolios).length){
-        // FIX: snapshot local trades ก่อนลบ — เพื่อ merge กลับ pending trades ที่ยังไม่ sync ขึ้น Sheet
-        // (เช่น Topstep import ที่ใช้ no-cors บันทึกลง localStorage แล้วแต่ Sheet ยังไม่รับ)
+        // Sheet = source of truth — ล้าง local ทั้งหมดก่อน write ใหม่
         var allKnownPorts = Object.keys(S.portfolios).concat(Object.keys(d.portfolios));
         var seenPorts = {};
-        var _localTradesSnapshot = {}; // เก็บ local trades ก่อนลบ
         allKnownPorts.forEach(function(pid){
           if(!seenPorts[pid]){
             seenPorts[pid]=1;
-            // เก็บ snapshot ก่อน remove
-            try{ _localTradesSnapshot[pid] = JSON.parse(localStorage.getItem('port_'+pid+'_t')||'{}'); }catch(e){ _localTradesSnapshot[pid]={}; }
             localStorage.removeItem('port_'+pid+'_t');
             localStorage.removeItem('port_'+pid+'_s');
           }
         });
-        // ล้าง dt_trades เก่าด้วยเพราะ DataTrades จะ replace ใหม่จาก Sheet
         localStorage.removeItem('dt_trades');
 
         var merged = {};
@@ -2762,54 +2751,22 @@ function syncFromSheet(onDone){
             imgLink:     gs(t,['ImageLink','imagelink','imgLink'])
           });
         });
-        // Save each portfolio's trades to localStorage
-        // FIX: ใช้ข้อมูลจาก Sheet เป็น source of truth ต่อ portfolio
-        // เก็บเฉพาะวันที่มาจาก Sheet แทนที่ (replace) ไม่ใช่ merge กับของเก่า
-        // เพื่อป้องกัน duplicate orders จากการ merge ซ้ำหลายรอบ
+        // Sheet = source of truth ทั้งหมด ไม่ merge กับ local (ป้องกัน duplicate)
         var portsFromSheet = Object.keys(byPort);
         portsFromSheet.forEach(function(port){
-          // กรองวันที่ถูกลบ (tombstone) ออกก่อน save
           var tombstone = {};
           try{ tombstone = JSON.parse(localStorage.getItem('tj_deleted_'+port)||'{}'); }catch(e){}
           var filtered = {};
           Object.keys(byPort[port]).forEach(function(date){
-            if(!tombstone[date]) filtered[date] = byPort[port][date];
+            if(!tombstone[date]){ filtered[date] = _dedupTrades(byPort[port][date]||[]); }
           });
-          // ── FIX: Merge Sheet data กับ local — ไม่ลบ trades ที่ local มีแต่ Sheet ยังไม่ได้รับ ──
-          // เหตุผล: Topstep import / manual add อาจยังไม่ sync ขึ้น Sheet ทัน
-          // Strategy: Sheet เป็น source of truth ต่อ trade ID — ถ้า Sheet มี ID นั้น ใช้ของ Sheet
-          //           ถ้า local มี trade ที่ Sheet ไม่มี → เก็บไว้ (pending sync)
-          // ใช้ snapshot ที่เก็บไว้ก่อนทำ removeItem เพื่อให้ pending trades ไม่หาย
-          var localRaw = _localTradesSnapshot[port] || {};
-          try{ var _lsCheck = localStorage.getItem('port_'+port+'_t'); if(_lsCheck) localRaw = JSON.parse(_lsCheck); }catch(e){}
-          // สร้าง set ของ IDs ที่มีใน Sheet (filtered)
-          var sheetIds = {};
-          Object.keys(filtered).forEach(function(date){
-            (filtered[date]||[]).forEach(function(t){ if(t.id) sheetIds[String(t.id)]=true; });
-          });
-          // Merge: เริ่มจาก filtered (Sheet) แล้วเพิ่ม local trades ที่ไม่มีใน Sheet
-          var merged = {};
-          Object.keys(filtered).forEach(function(date){ merged[date] = filtered[date].slice(); });
-          Object.keys(localRaw).forEach(function(date){
-            (localRaw[date]||[]).forEach(function(t){
-              var tid = String(t.id||'');
-              if(tid && sheetIds[tid]) return; // Sheet มีแล้ว ข้าม
-              if(!tid) return; // ไม่มี id ข้าม
-              if(!merged[date]) merged[date] = [];
-              merged[date].push(t); // local-only trade → เก็บไว้
-            });
-          });
-          // dedup ทุกวัน
-          Object.keys(merged).forEach(function(date){ merged[date]=_dedupTrades(merged[date]||[]); });
-          localStorage.setItem('port_'+port+'_t', JSON.stringify(merged));
-          // อัปเดต S.trades ใน memory
+          localStorage.setItem('port_'+port+'_t', JSON.stringify(filtered));
           if(port === S.currentPortfolio){
             var popupOpen = document.getElementById('mDay') && document.getElementById('mDay').classList.contains('open');
-            Object.keys(merged).forEach(function(date){
+            Object.keys(filtered).forEach(function(date){
               if(popupOpen && S.mKey && date === S.mKey) return;
-              S.trades[date] = merged[date];
+              S.trades[date] = filtered[date];
             });
-            // เพิ่มวันใหม่ที่ local มีแต่ merged ไม่มี (ไม่ลบอะไร)
           }
         });
       }
@@ -2867,6 +2824,7 @@ function syncFromSheet(onDone){
             existing[date] = sheetSess;
           });
           localStorage.setItem('port_'+port+'_s', JSON.stringify(existing));
+          if(port === S.currentPortfolio){ S.sessions = existing; }
         });
       }
 
@@ -2994,9 +2952,11 @@ function syncFromSheet(onDone){
       updateStats(); renderCal(); updateRecent(); renderTodayOrders();
       var cnt = (d.trades||[]).length + (d.dataTrades||[]).length;
       showToast('✅ Sync สำเร็จ! ดึง '+cnt+' trades + '+Object.keys(d.portfolios||{}).length+' พอร์ต','success');
+      _syncInProgress = false;
       if(onDone) onDone();
     })
     .catch(function(err){
+      _syncInProgress = false;
       var msg=err.message||'unknown';
       showToast('❌ Sync ล้มเหลว: '+msg,'error');
       if(sheetRes){
@@ -3038,6 +2998,7 @@ function init(){
     // Sync เมื่อมี scriptUrl และมี session (login แล้ว) หรือไม่ได้ใช้ auth system
     var hasAuth = (typeof window.AUTH_GAS_URL !== 'undefined') && window.AUTH_GAS_URL;
     if(S.scriptUrl && (_authSession || !hasAuth)){ setConn(true); syncFromSheet(); }
+    window._initSyncDone = !!(S.scriptUrl && (_authSession || !hasAuth));
     updateBadge();
   }catch(e){}
   var tdEl=document.getElementById('todayDate');if(tdEl)tdEl.textContent=new Date().toLocaleDateString('th-TH',{year:'numeric',month:'short',day:'numeric'});
@@ -4198,18 +4159,18 @@ function mEmoClick(e){
 }
 
 function _dedupTrades(arr){
-  // ลบ duplicate trades โดยเก็บ trade ล่าสุดของแต่ละ id
-  var seen={};
-  return arr.filter(function(t){
-    var key=String(t.id||'');
-    if(!key){
-      // ไม่มี id → ใช้ entry+side+lots เป็น key
-      key=(t.entry||'')+'_'+(t.side||'')+'_'+(t.lots||'')+'_'+(t.asset||'');
-    }
-    if(seen[key]) return false;
-    seen[key]=true;
-    return true;
-  });
+  var seenId={}, seenFp={}, result=[];
+  for(var i=arr.length-1;i>=0;i--){
+    var t=arr[i];
+    var id=String(t.id||t._id||'');
+    var eTime=String(t.entryDate||t.entryDateRaw||t.entryTime||'');
+    var fp=(t.date||'')+'|'+(t.asset||'')+'|'+(t.side||'')+'|'+(t.entry||'')+'|'+eTime.substring(0,5)+'|'+(t.lots||'');
+    var skip=false;
+    if(id){ if(seenId[id]){skip=true;}else{seenId[id]=true;} }
+    if(!skip&&fp){ if(seenFp[fp]){skip=true;}else{seenFp[fp]=true;} }
+    if(!skip) result.unshift(t);
+  }
+  return result;
 }
 function openDay(dt){
   S.mKey=dk(dt);S.mTrades=_dedupTrades(JSON.parse(JSON.stringify(S.trades[S.mKey]||[])));
@@ -10190,7 +10151,7 @@ if(document.readyState==='loading'){
         <div class="help-section-title">📝 Code ทั้งหมด — คัดลอกแล้ววางใน Apps Script</div>
         <div style="position:relative;">
           <div id="helpCodeBlock" class="help-code-block" style="max-height:340px;overflow-y:auto;">/* =========================================
-   TradeLog Pro+ — Google Apps Script v5.0
+   TradeLog Pro+ — Google Apps Script v5.1
    รองรับ: Portfolio | Data Mode Trades
            Candle | Mode | TF | Trend
            Zone | Confirm | Sessions
@@ -10491,7 +10452,7 @@ function setupSheets(){
     .addItem('⚙️ Setup Sheets','setupSheets')
     .addItem('🔍 Check &amp; Clean Duplicates','checkDuplicates')
     .addToUi();
-  SpreadsheetApp.getUi().alert('✅ TradeLog Pro+ v5.0 พร้อม!\n\nSheets: Trades | DataTrades | Sessions | Summary | Assets | Log | DeletedPorts\nรองรับ: Multi-Portfolio + Data Mode + Custom Assets + Fees + Commission\nLog: ครบทุก action\n\n⚡ หมายเหตุ: ถ้า Sheet เดิมมี Header ไม่ครบ ระบบจะเพิ่ม Column ใหม่ให้อัตโนมัติ');
+  SpreadsheetApp.getUi().alert('✅ TradeLog Pro+ v5.1 พร้อม!\n\nSheets: Trades | DataTrades | Sessions | Summary | Assets | Log | DeletedPorts\nรองรับ: Multi-Portfolio + Data Mode + Custom Assets + Fees + Commission\nLog: ครบทุก action\n\n⚡ หมายเหตุ: ถ้า Sheet เดิมมี Header ไม่ครบ ระบบจะเพิ่ม Column ใหม่ให้อัตโนมัติ');
 }
 
 // ── checkDuplicates ──
@@ -10531,7 +10492,7 @@ function checkDuplicates(){
             <div class="help-step-num" style="background:rgba(168,85,247,.15);color:var(--purple);">2</div>
             <div class="help-step-body">
               <div class="help-step-title">วาง Code และ Run setupSheets()</div>
-              <div class="help-step-desc">ลบ code เดิมทั้งหมดออก → วาง code จากแท็บ <b>📋 Apps Script</b> → กด <span class="help-badge" style="background:var(--green-dim);color:var(--green);">▶ Run</span> (เลือก function: <code>setupSheets</code>) → อนุญาต Permission → รอ Alert "✅ TradeLog Pro+ v5.0 พร้อม!"</div>
+              <div class="help-step-desc">ลบ code เดิมทั้งหมดออก → วาง code จากแท็บ <b>📋 Apps Script</b> → กด <span class="help-badge" style="background:var(--green-dim);color:var(--green);">▶ Run</span> (เลือก function: <code>setupSheets</code>) → อนุญาต Permission → รอ Alert "✅ TradeLog Pro+ v5.1 พร้อม!"</div>
               <div class="help-img-placeholder">📸 วาง Code → Run setupSheets</div>
             </div>
           </div>
@@ -11543,8 +11504,10 @@ async function _processGoogleLogin(email, name){
       // ถ้าไม่มี scriptUrl → แสดง setup overlay
       if(!session.scriptUrl && !localStorage.getItem('tj_url')){
         setTimeout(function(){ _showSetupSheetOverlay(); }, 600);
-      } else if(S.scriptUrl){
+      } else if(S.scriptUrl && !window._initSyncDone){
         setConn(true); syncFromSheet();
+      } else if(S.scriptUrl){
+        setConn(true);
       }
     } else {
       showToast('❌ ' + (data.msg || 'เข้าสู่ระบบด้วย Google ไม่สำเร็จ'), 'error');
@@ -11609,8 +11572,10 @@ async function authDoLogin(){
       var localUrl = localStorage.getItem('tj_url') || '';
       if(!session.scriptUrl && !localUrl){
         setTimeout(function(){ _showSetupSheetOverlay(); }, 600);
-      } else if(S.scriptUrl){
+      } else if(S.scriptUrl && !window._initSyncDone){
         setConn(true); syncFromSheet();
+      } else if(S.scriptUrl){
+        setConn(true);
       }
     } else {
       err.textContent = '❌ ' + (data.msg || 'Username หรือ Password ไม่ถูกต้อง');
